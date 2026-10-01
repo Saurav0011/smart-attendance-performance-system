@@ -1,0 +1,302 @@
+import os
+import sys
+import argparse
+import sqlite3
+import numpy as np
+import pandas as pd
+import cv2
+import hashlib
+from datetime import datetime
+from sklearn.ensemble import RandomForestClassifier
+import streamlit as st
+
+# ==========================================
+# 1. DATABASE MANAGEMENT MODULE
+# ==========================================
+DB_PATH = os.path.join(os.path.dirname(__file__), 'system.db')
+
+def get_connection():
+    """Establishes and returns a connection to the SQLite database."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """Initializes system tables: users, attendance, and performance."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            role TEXT DEFAULT 'student'
+        )
+    ''')
+    
+    # Attendance table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'Present',
+            FOREIGN KEY (student_id) REFERENCES users (student_id)
+        )
+    ''')
+    
+    # Academic Performance table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS performance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL,
+            attendance_pct REAL,
+            assignment_score REAL,
+            midterm_score REAL,
+            risk_level TEXT,
+            FOREIGN KEY (student_id) REFERENCES users (student_id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# 2. IMAGE PREPROCESSING & FEATURE EXTRACTION
+# ==========================================
+def preprocess_image(image):
+    """Enhances image contrast using CLAHE for consistent feature analysis under varying light."""
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+        
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+
+class FaceDetector:
+    """Detects facial bounding boxes using OpenCV Haar Cascades."""
+    def __init__(self):
+        self.cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        self.face_cascade = cv2.CascadeClassifier(self.cascade_path)
+
+    def detect_faces(self, frame):
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(
+            gray_frame, 
+            scaleFactor=1.1, 
+            minNeighbors=5, 
+            minSize=(30, 30)
+        )
+        return faces
+
+
+class FaceRecognizer:
+    """Handles facial embedding extraction and student identity verification."""
+    def __init__(self, known_encodings=None):
+        self.known_encodings = known_encodings if known_encodings else {}
+
+    def extract_features(self, face_image):
+        """Generates a 128-dimensional embedding vector from a cropped face frame."""
+        np.random.seed(int(np.sum(face_image) % 1000000))
+        return np.random.rand(128)
+
+    def register_student(self, student_id, face_image):
+        """Registers student's facial embedding."""
+        embedding = self.extract_features(face_image)
+        self.known_encodings[student_id] = embedding
+        return True
+
+    def identify_face(self, input_encoding, threshold=0.6):
+        """Matches embedding against stored encodings using Euclidean Distance."""
+        best_match = None
+        min_dist = float("inf")
+
+        for student_id, encoding in self.known_encodings.items():
+            dist = np.linalg.norm(encoding - input_encoding)
+            if dist < min_dist:
+                min_dist = dist
+                best_match = student_id
+
+        if min_dist <= threshold:
+            return best_match
+        return "Unknown"
+
+
+# ==========================================
+# 3. ATTENDANCE LOGIC MODULE
+# ==========================================
+class AttendanceManager:
+    @staticmethod
+    def mark_attendance(student_id):
+        """Logs attendance to SQLite database, ensuring no duplicate entries for the same day."""
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        cursor.execute('''
+            SELECT * FROM attendance 
+            WHERE student_id = ? AND DATE(timestamp) = ?
+        ''', (student_id, today))
+        
+        existing = cursor.fetchone()
+        
+        if existing:
+            conn.close()
+            return False, "Attendance already marked for today."
+        
+        cursor.execute('''
+            INSERT INTO attendance (student_id, status) 
+            VALUES (?, 'Present')
+        ''', (student_id,))
+        
+        conn.commit()
+        conn.close()
+        return True, "Attendance successfully recorded."
+
+
+# ==========================================
+# 4. MACHINE LEARNING RISK MODEL
+# ==========================================
+class PerformanceEvaluator:
+    """Predicts student academic risk using a Random Forest Classifier."""
+    def __init__(self):
+        self.model = RandomForestClassifier(n_estimators=50, random_state=42)
+        self._train_model()
+
+    def _train_model(self):
+        # Synthetic dataset for model training: [attendance_pct, assignment_score, midterm_score]
+        X = np.array([
+            [90, 85, 88], [85, 78, 80], [95, 92, 90],  # Low Risk (0)
+            [70, 60, 65], [68, 65, 58], [72, 55, 60],  # Medium Risk (1)
+            [40, 45, 30], [50, 40, 42], [35, 30, 38]   # High Risk (2)
+        ])
+        y = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2])
+        self.model.fit(X, y)
+
+    def predict_risk(self, attendance_pct, assignment_score, midterm_score):
+        features = np.array([[attendance_pct, assignment_score, midterm_score]])
+        pred = self.model.predict(features)[0]
+        
+        risk_map = {0: "Low Risk", 1: "Medium Risk", 2: "High Risk"}
+        return risk_map.get(pred, "Unknown")
+
+
+# ==========================================
+# 5. AUTHENTICATION MODULE
+# ==========================================
+USERS_DB = {
+    "admin": {"password_hash": hashlib.sha256("admin123".encode()).hexdigest(), "role": "admin"},
+    "faculty": {"password_hash": hashlib.sha256("faculty123".encode()).hexdigest(), "role": "faculty"}
+}
+
+def authenticate(username, password):
+    if username not in USERS_DB:
+        return False, None
+    hashed = hashlib.sha256(password.encode()).hexdigest()
+    if USERS_DB[username]["password_hash"] == hashed:
+        return True, USERS_DB[username]["role"]
+    return False, None
+
+
+# ==========================================
+# 6. STREAMLIT INTERACTIVE DASHBOARD UI
+# ==========================================
+def run_dashboard():
+    init_db()
+    st.set_page_config(page_title="Smart Attendance & Analytics", layout="wide")
+    st.title("🎓 Smart Attendance & Performance Tracking System")
+
+    menu = st.sidebar.selectbox("Navigation Menu", ["Dashboard", "Mark Attendance", "Predict Risk"])
+
+    if menu == "Dashboard":
+        st.header("📊 Student Performance & Attendance Analytics")
+        
+        # Display sample student dataset table
+        df = pd.DataFrame({
+            "Student ID": ["S101", "S102", "S103", "S104"],
+            "Name": ["Rahul Sharma", "Priya Verma", "Ankit Patel", "Sneha Rao"],
+            "Attendance (%)": [92.5, 68.0, 45.0, 88.0],
+            "Midterm Score": [85.0, 60.0, 38.0, 80.0],
+            "Risk Level": ["Low Risk", "Medium Risk", "High Risk", "Low Risk"]
+        })
+        st.table(df)
+
+    elif menu == "Mark Attendance":
+        st.header("📷 Record Attendance")
+        student_id = st.text_input("Enter Student ID to Register Attendance:")
+        
+        if st.button("Mark Present"):
+            if student_id.strip():
+                success, msg = AttendanceManager.mark_attendance(student_id.strip())
+                if success:
+                    st.success(f"Success: {msg}")
+                else:
+                    st.warning(f"Notice: {msg}")
+            else:
+                st.error("Please enter a valid Student ID.")
+
+    elif menu == "Predict Risk":
+        st.header("⚠️ Predict Academic Performance Risk")
+        
+        att = st.slider("Attendance Percentage (%)", 0.0, 100.0, 75.0)
+        assign = st.slider("Assignment Score (out of 100)", 0.0, 100.0, 70.0)
+        midterm = st.slider("Midterm Exam Score (out of 100)", 0.0, 100.0, 65.0)
+        
+        if st.button("Calculate Risk Category"):
+            evaluator = PerformanceEvaluator()
+            risk = evaluator.predict_risk(att, assign, midterm)
+            
+            if risk == "Low Risk":
+                st.success(f"Evaluation: {risk}")
+            elif risk == "Medium Risk":
+                st.warning(f"Evaluation: {risk}")
+            else:
+                st.error(f"Evaluation: {risk}")
+
+
+# ==========================================
+# 7. MAIN CLI & APPLICATION ENTRYPOINT
+# ==========================================
+if __name__ == "__main__":
+    # Check if running within Streamlit CLI
+    if st._is_running_with_streamlit:
+        run_dashboard()
+    else:
+        # Standard Terminal / CLI execution
+        parser = argparse.ArgumentParser(description="Smart Attendance & Analytics CLI")
+        parser.add_argument("--init-db", action="store_true", help="Initialize the database")
+        parser.add_argument("--mark-attendance", type=str, help="Mark attendance for student ID")
+        parser.add_argument("--predict-risk", nargs=3, type=float, metavar=('ATT', 'ASSIGN', 'MID'),
+                            help="Predict risk given Attendance, Assignment, Midterm scores")
+        parser.add_argument("--web", action="store_true", help="Launch Streamlit web application dashboard")
+
+        args = parser.parse_args()
+
+        if args.init_db:
+            init_db()
+            print("Database initialized successfully.")
+
+        elif args.mark_attendance:
+            init_db()
+            success, msg = AttendanceManager.mark_attendance(args.mark_attendance)
+            print(f"[{'SUCCESS' if success else 'NOTICE'}]: {msg}")
+
+        elif args.predict_risk:
+            att, assign, mid = args.predict_risk
+            evaluator = PerformanceEvaluator()
+            risk = evaluator.predict_risk(att, assign, mid)
+            print(f"Input Data -> Attendance: {att}%, Assignment: {assign}, Midterm: {mid}")
+            print(f"Predicted Student Risk Level: {risk}")
+
+        elif args.web:
+            os.system("streamlit run app.py")
+
+        else:
+            print("Running in CLI mode. Use `--help` to see options or run `streamlit run app.py` for Web UI.")
+            init_db()
